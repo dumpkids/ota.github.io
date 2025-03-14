@@ -1,0 +1,251 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <EEPROM.h>  // Library untuk EEPROM
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32httpUpdate.h>  // Library untuk OTA update
+
+#define RELAY_PIN 25 // Pin relay (sesuaikan dengan kebutuhan)
+#define FIRMWARE_VERSION 1.0
+#define UPDATE_URL "https://dumpkids.github.io/ota.github.io/update.json"
+
+const char* mqtt_server = "mqtt.multitekindo.com";
+const int mqtt_port = 8884;
+const char* mqtt_user = "multitek";
+const char* mqtt_pass = "multitekadmin";
+
+WiFiClient espClient; // Menggunakan WiFiClient
+PubSubClient client(espClient);
+
+unsigned long lastStatusTime = 0;
+const unsigned long statusInterval = 1000; // Kirim status setiap 1 detik
+
+TaskHandle_t task0;  // Task untuk menjalankan fungsionalitas lainnya (seperti status relay)
+
+// Deklarasi Fungsi
+void connectWifi();
+void checkUpdate();
+void ledBlink(void *pvParameter);
+t_httpUpdate_return updateOverHttp(String url_update);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void sendStatus();
+void reconnectWiFi();
+void reconnectMQTT();
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup EEPROM
+  EEPROM.begin(512);  // Inisialisasi EEPROM (ukuran bisa disesuaikan)
+
+  // Setup WiFi Manager
+  WiFiManager wifiManager;
+  wifiManager.setTimeout(60); // Timeout setelah 60 detik
+  delay(30000);  // Delay 30 detik setelah ESP32 menyala
+
+  // Mulai portal konfigurasi WiFi
+  if (!wifiManager.autoConnect("Pompaa")) {
+    Serial.println("Wi-Fi not connected within timeout, restarting ESP32...");
+    ESP.restart();  // Restart ESP32 jika tidak berhasil terhubung setelah timeout
+  }
+
+  Serial.println("WiFi Connected.");
+
+  // Setup pin relay
+  pinMode(RELAY_PIN, OUTPUT);
+
+  // Membaca status relay dari EEPROM dan menerapkannya sebelum koneksi MQTT
+  int relayStatus = EEPROM.read(0); // Membaca status relay yang disimpan
+  if (relayStatus == 1) {
+    digitalWrite(RELAY_PIN, HIGH);  // Jika status relay HIGH, aktifkan relay
+  } else {
+    digitalWrite(RELAY_PIN, LOW);   // Jika status relay LOW, matikan relay
+  }
+
+  // Setup MQTT client
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  // Cek koneksi Wi-Fi, jika belum terhubung lakukan reconnect
+  reconnectWiFi();  // Pastikan Wi-Fi terhubung sebelum melanjutkan proses lainnya
+
+  // Cek update firmware (OTA)
+  checkUpdate();
+}
+
+void loop() {
+  // Jika MQTT tidak terhubung
+  if (!client.connected()) {
+    // Cek koneksi Wi-Fi terlebih dahulu
+    reconnectWiFi();
+
+    // Setelah Wi-Fi terhubung, lanjutkan untuk menghubungkan ke MQTT
+    if (WiFi.status() == WL_CONNECTED) {
+      reconnectMQTT();
+    } else {
+      Serial.println("WiFi not connected. Cannot connect to MQTT.");
+    }
+  }
+
+  // Lanjutkan untuk menjalankan loop MQTT jika sudah terhubung
+  client.loop();
+
+  // Kirim status setiap detik
+  if (millis() - lastStatusTime > statusInterval) {
+    sendStatus();
+    lastStatusTime = millis();
+  }
+
+  // Cek update firmware lagi setiap 5 detik
+  checkUpdate();
+}
+
+void reconnectWiFi() {
+  // Cek status Wi-Fi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected. Attempting to reconnect...");
+
+    // Coba untuk menghubungkan kembali ke WiFi
+    WiFi.begin(); // Menggunakan SSID dan password yang disetting dalam WiFiManager
+
+    unsigned long startAttemptTime = millis();
+    // Coba untuk terhubung selama 10 detik
+    while (WiFi.status() != WL_CONNECTED) {
+      if (millis() - startAttemptTime >= 10000) { // Timeout setelah 10 detik
+        Serial.println("Failed to connect to WiFi within 10 seconds.");
+        delay(10000); // Delay 10 detik sebelum mencoba lagi
+        WiFi.begin(); // Coba lagi untuk menghubungkan
+      }
+      delay(500);  // Delay 500 ms untuk menghindari pemborosan CPU
+      Serial.print(".");
+    }
+
+    // Jika berhasil terhubung
+    Serial.println("WiFi connected.");
+  }
+}
+
+void reconnectMQTT() {
+  // Coba menghubungkan kembali ke MQTT
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+    if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
+      Serial.println("Connected to MQTT");
+
+      // Subscribe ke topik yang diinginkan
+      client.subscribe("pompa/vbt");
+      client.subscribe("sensor/vbt");
+    } else {
+      Serial.print("Failed to connect to MQTT, rc=");
+      Serial.print(client.state());
+      delay(2000);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  payload[length] = '\0';  // Pastikan payload menjadi string
+  String message = String((char*)payload);
+
+  // Jika topik adalah pompa/vbt
+  if (String(topic) == "pompa/vbt") {
+    if (message == "HIGH") {
+      digitalWrite(RELAY_PIN, HIGH);
+      EEPROM.write(0, 1);  // Simpan status relay HIGH ke EEPROM
+      EEPROM.commit();  // Simpan perubahan ke EEPROM
+      sendStatus(); // Kirim status setelah mengubah relay
+      client.publish("pompavbt/pesanterkirim", "Pompa Nyala");
+    } else if (message == "LOW") {
+      digitalWrite(RELAY_PIN, LOW);
+      EEPROM.write(0, 0);  // Simpan status relay LOW ke EEPROM
+      EEPROM.commit();  // Simpan perubahan ke EEPROM
+      sendStatus(); // Kirim status setelah mengubah relay
+      client.publish("pompavbt/pesanterkirim", "Pompa Mati");
+    }
+  }
+
+  // Jika topik adalah sensor/vbt
+  if (String(topic) == "sensor/vbt") {
+    if (message == "HIGH") {
+      digitalWrite(RELAY_PIN, HIGH);
+      EEPROM.write(0, 1);  // Simpan status relay HIGH ke EEPROM
+      EEPROM.commit();  // Simpan perubahan ke EEPROM
+      sendStatus(); // Kirim status setelah mengubah relay
+      client.publish("pompavbt/pesanterkirim", "Pompa Auto Nyala");
+    } else if (message == "LOW") {
+      digitalWrite(RELAY_PIN, LOW);
+      EEPROM.write(0, 0);  // Simpan status relay LOW ke EEPROM
+      EEPROM.commit();  // Simpan perubahan ke EEPROM
+      sendStatus(); // Kirim status setelah mengubah relay
+      client.publish("pompavbt/pesanterkirim", "Pompa Auto Mati");
+    }
+  }
+}
+
+void sendStatus() {
+  // Kirim status setiap detik
+  String relayStatus = (digitalRead(RELAY_PIN) == HIGH) ? "HIGH" : "LOW";
+
+  String payload = relayStatus;
+  client.publish("pompavbt/statuspompa", payload.c_str());
+
+  Serial.println("Status sent: " + payload);
+}
+
+void checkUpdate() {
+  Serial.println("Checking update");
+  HTTPClient http;
+  String response;
+  String url = UPDATE_URL;
+  http.begin(url);
+  int httpCode = http.GET();
+  response = http.getString();
+  Serial.println(response);
+
+  if (httpCode == HTTP_CODE_OK) {
+    StaticJsonDocument<1024> doc;
+    deserializeJson(doc, response);
+    JsonObject obj = doc.as<JsonObject>();
+    String version = obj[String("version")];
+    String url_update = obj[String("url")];
+    Serial.println("Latest version: " + version);
+    Serial.println("Update URL: " + url_update);
+
+    if (version.toDouble() > FIRMWARE_VERSION) {
+      Serial.println("Update Available");
+      if (updateOverHttp(url_update) == HTTP_UPDATE_OK) {
+        Serial.println("Update Success");
+      } else {
+        Serial.println("Update Failed");
+      }
+    } else {
+      Serial.println("No Update Available");
+    }
+  } else {
+    Serial.println("Failed to connect to update server");
+  }
+}
+
+t_httpUpdate_return updateOverHttp(String url_update) {
+  t_httpUpdate_return ret;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    ret = ESPhttpUpdate.update(url_update);
+
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+        return ret;
+
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("HTTP_UPDATE_NO_UPDATES");
+        return ret;
+
+      case HTTP_UPDATE_OK:
+        Serial.println("HTTP_UPDATE_OK");
+        return ret;
+    }
+  }
+}
